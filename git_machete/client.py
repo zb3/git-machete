@@ -1592,7 +1592,7 @@ class MacheteClient:
         print('Checking for open GitHub PRs... ', end='', flush=True)
         current_user: Optional[str] = github_client.derive_current_user_login()
         debug('Current GitHub user is ' + (bold(current_user or '<none>')))
-        all_open_prs: List[GitHubPullRequest] = github_client.derive_pull_requests()
+        all_open_prs: List[GitHubPullRequest] = github_client.derive_open_pull_requests()
         print(fmt('<green><b>OK</b></green>'))
         self.__sync_annotations_to_branch_layout_file(all_open_prs, current_user, verbose=True)
 
@@ -2021,11 +2021,11 @@ class MacheteClient:
                 f"of the {bold(branch)} branch.")
 
     def checkout_github_prs(self,
-                            pr_nos: Optional[List[int]],
+                            pr_numbers: Optional[List[int]],
                             *,
-                            all_opened_prs: bool = False,
-                            my_opened_prs: bool = False,
-                            opened_by: Optional[str] = None,
+                            all: bool = False,
+                            mine: bool = False,
+                            by: Optional[str] = None,
                             fail_on_missing_current_user_for_my_opened_prs: bool = False
                             ) -> None:
         domain = self.__derive_github_domain()
@@ -2034,20 +2034,43 @@ class MacheteClient:
         print('Checking for open GitHub PRs... ', end='', flush=True)
 
         current_user: Optional[str] = github_client.derive_current_user_login()
-        if not current_user and my_opened_prs:
-            msg = ("Could not determine current user name, please check that the GitHub API token provided by one of the: "
-                   f"{GitHubToken.get_possible_providers()}is valid.")
-            if fail_on_missing_current_user_for_my_opened_prs:
-                raise MacheteException(msg)
-            else:
-                warn(msg)
-                return
-        all_open_prs: List[GitHubPullRequest] = github_client.derive_pull_requests()
-        print(fmt('<green><b>OK</b></green>'))
-
-        applicable_prs: List[GitHubPullRequest] = self.__get_applicable_pull_requests(
-            pr_nos, all_opened_prs_from_github=all_open_prs, github_client=github_client,
-            all=all_opened_prs, mine=my_opened_prs, by=opened_by, user=current_user)
+        applicable_prs: List[GitHubPullRequest] = []
+        if pr_numbers:
+            prs_from_github = [(pr_no, github_client.get_pull_request_by_number_or_none(pr_no)) for pr_no in pr_numbers]
+            print(fmt('<green><b>OK</b></green>'))
+            for pr_no, pr_from_github in prs_from_github:
+                if pr_from_github:
+                    applicable_prs += [pr_from_github]
+                else:
+                    raise MacheteException(f"PR #{bold(str(pr_no))} is not found in repository "
+                                           f"{bold(github_client.organization)}/{bold(github_client.repository)}")
+        elif mine:
+            if not current_user:
+                msg = ("Could not determine current user name, please check that the GitHub API token provided by one of the: "
+                       f"{GitHubToken.get_possible_providers()}is valid.")
+                if fail_on_missing_current_user_for_my_opened_prs:
+                    raise MacheteException(msg)
+                else:
+                    warn(msg)
+                    return
+            applicable_prs = github_client.derive_open_pull_requests_for_authors([current_user])
+            print(fmt('<green><b>OK</b></green>'))
+            if not applicable_prs:
+                warn(f"Current user {bold(current_user)} has no open pull request in repository "
+                     f"{bold(github_client.organization)}/{bold(github_client.repository)}")
+        elif by:
+            applicable_prs = github_client.derive_open_pull_requests_for_authors([by])
+            print(fmt('<green><b>OK</b></green>'))
+            if not applicable_prs:
+                warn(f"User {bold(by)} has no open pull request in repository "
+                     f"{bold(github_client.organization)}/{bold(github_client.repository)}")
+        elif all:  # pragma: no branch
+            all_open_prs: List[GitHubPullRequest] = github_client.derive_open_pull_requests()
+            print(fmt('<green><b>OK</b></green>'))
+            if not all_open_prs:
+                warn(f"Currently there are no pull requests opened in repository "
+                     f"{bold(github_client.organization)}/{bold(github_client.repository)}")
+            applicable_prs = all_open_prs
 
         debug(f'organization is {org_repo_remote.organization}, repository is {org_repo_remote.repository}')
         self.__git.fetch_remote(org_repo_remote.remote)
@@ -2078,7 +2101,8 @@ class MacheteClient:
                 warn(f'Pull request #{bold(str(pr.number))} is already closed.')
             debug(f'found {pr}')
 
-            path: List[LocalBranchShortName] = self.__get_path_from_pr_chain(pr, all_open_prs)
+            path: List[LocalBranchShortName] = self.__get_path_from_pr_chain(
+                pr, github_client.derive_open_pull_requests())  # !!!!!!!!!!!! all_open_prs?
             reversed_path: List[LocalBranchShortName] = path[::-1]  # need to add from root downwards
             for index, branch in enumerate(reversed_path):
                 if branch not in self.managed_branches:
@@ -2103,7 +2127,8 @@ class MacheteClient:
                         checked_out_prs.append(pr)
 
         debug('Current GitHub user is ' + (current_user or '<none>'))
-        self.__sync_annotations_to_branch_layout_file(all_open_prs, current_user=current_user, verbose=False)
+        self.__sync_annotations_to_branch_layout_file(github_client.derive_open_pull_requests(),
+                                                      current_user=current_user, verbose=False)  # all_open_prs?
         if len(applicable_prs) == 1:
             self.__git.checkout(LocalBranchShortName.of(pr.head))
 
@@ -2115,51 +2140,6 @@ class MacheteClient:
             path.append(LocalBranchShortName.of(pr.base))
             pr = utils.find_or_none(lambda x: x.head == pr.base, all_open_prs)  # type: ignore[union-attr]
         return path
-
-    @staticmethod
-    def __get_applicable_pull_requests(prs_list: Optional[List[int]],
-                                       all_opened_prs_from_github: List[GitHubPullRequest],
-                                       github_client: GitHubClient,
-                                       all: bool,
-                                       mine: bool,
-                                       by: Optional[str],
-                                       user: Optional[str]) -> List[GitHubPullRequest]:
-        result: List[GitHubPullRequest] = []
-        if prs_list:
-            for pr_no in prs_list:
-                _pr: Optional[GitHubPullRequest] = utils.find_or_none(lambda x: x.number == pr_no,
-                                                                      all_opened_prs_from_github)
-                if _pr:
-                    result.append(_pr)
-                else:
-                    pr_from_github = github_client.get_pull_request_by_number_or_none(pr_no)
-                    if pr_from_github:
-                        result.append(pr_from_github)
-                    else:
-                        raise MacheteException(f"PR #{bold(str(pr_no))} is not found in repository "
-                                               f"{bold(github_client.organization)}/{bold(github_client.repository)}")
-            return result
-        if all:
-            if not all_opened_prs_from_github:
-                warn(f"Currently there are no pull requests opened in repository "
-                     f"{bold(github_client.organization)}/{bold(github_client.repository)}")
-                return []
-            return all_opened_prs_from_github
-        elif mine and user:
-            result = [pr for pr in all_opened_prs_from_github if pr.user == user]
-            if not result:
-                warn(f"Current user {bold(user)} has no open pull request in repository "
-                     f"{bold(github_client.organization)}/{bold(github_client.repository)}")
-                return []
-            return result
-        elif by:
-            result = [pr for pr in all_opened_prs_from_github if pr.user == by]
-            if not result:
-                warn(f"User {bold(by)} has no open pull request in repository "
-                     f"{bold(github_client.organization)}/{bold(github_client.repository)}")
-                return []
-            return result
-        return []  # pragma: no cover; should never happen
 
     def __get_url_for_remote(self) -> Dict[str, str]:
         return {
@@ -2185,7 +2165,7 @@ class MacheteClient:
 
         debug(f'organization is {org_repo_remote.organization}, repository is {org_repo_remote.repository}')
 
-        prs: List[GitHubPullRequest] = github_client.derive_pull_requests_by_head(head)
+        prs: List[GitHubPullRequest] = github_client.derive_open_pull_requests_for_heads([head])
         if not prs:
             if ignore_if_missing:
                 warn(f"no PRs have `{head}` as its head")
