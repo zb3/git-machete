@@ -5,7 +5,8 @@ set -e -o pipefail -u
 # Adapted from https://unix.stackexchange.com/a/668827
 
 comptest () {
-  eval "$(git machete completion zsh)"
+  eval "$(<git-machete.completion.zsh)"
+  # "$(git machete completion zsh)"
 
   # Gather all matching completions in this array.
   # -U discards duplicates.
